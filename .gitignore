@@ -1,0 +1,7 @@
+data/
+**/MNIST/
+**/MNIST/**
+
+__pycache__/
+*.py[cod]
+*$py.class
