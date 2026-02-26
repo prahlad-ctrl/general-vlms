@@ -1,3 +1,5 @@
+''' This is the contrastive vision encoder part without the linear projection (from the reference img)'''
+
 from typing import Optional, Tuple
 import torch
 from torch import nn
