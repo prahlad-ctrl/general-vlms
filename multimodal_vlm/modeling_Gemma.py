@@ -15,7 +15,7 @@ class GemmaConfig:
              num_key_value_heads,
              head_dim = 256,
              max_position_embedding= 8192,
-             rms_norm_rps = 1e-6,
+             rms_norm_eps = 1e-6,
              rope_theta=10000.0,
              attention_bias=False,
              attention_dropout= 0.0,
@@ -31,7 +31,7 @@ class GemmaConfig:
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.max_position_embedding = max_position_embedding
-        self.rms_norm_rps = rms_norm_rps
+        self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
         self.attention_bias = attention_bias
         self.pad_token_id = pad_token_id
@@ -63,7 +63,81 @@ class PaliGemmaConfig():
         self.vocab_size = self.text_config.vocab_size
         self.text_config = num_image_token = (self.vision_config.image_size//self.vision_config.patch_size)**2
         self.vision_config.projection_dim = projection_dim
+
+class GemmaModel(nn.Module):
+    def __init__(self, config: GemmaConfig):
+        super().__init__()
+        self.comfig = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_token = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList([GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.norm = GemmaRMSNorm(config.hidden_size, eps= config.rms_norm_eps)
         
+    def get_input_embeddings(self):
+        return self.embed_token
+    
+    def forward(self,
+                attention_mask: Optional[torch.Tensor]=None,
+                position_ids: Optional[torch.LongTensor]=None,
+                input_embeds: Optional[torch.FloatTensor]=None,
+                kv_cache: Optional[KVCache]=None) -> torch.FloatTensor:
+        
+        hidden_state = input_embeds
+        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_state.dtype)
+        hidden_state= hidden_state*normalizer
+        
+        for decoder_layer in self.layers:
+            hidden_state = decoder_layer(hidden_state,
+                                         attention_mask=attention_mask,
+                                         position_ids=position_ids,
+                                         kv_cache=kv_cache)
+        
+        hidden_state=self.norm(hidden_state)
+        
+        return hidden_state
+
+class GemmaForCasualLM(nn.Module):
+    def __init__(self, config):
+        self.config = config
+        self.model = GemmaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+    
+    def tie_weights(self):
+        self.lm_head.weight = self.model.embed_tokens.weight
+        
+    def forward(self,
+                attention_mask: Optional[torch.Tensor]= None,
+                position_ids: Optional[torch.LongTensor]=None,
+                input_embeds: Optional[torch.FloatTensor]=None,
+                kv_cache: Optional[KVCache]=None) -> Tuple:
+        outputs = self.model(attention_mask=attention_mask,
+                             position_ids=position_ids,
+                             input_embeds=input_embeds,
+                             kv_cache=kv_cache)
+        hidden_states = outputs
+        logits = self.lm_head(hidden_states)
+        logits = logits.float()
+        
+        return_data={"logits":logits}
+        
+        if kv_cache is not None:
+            return_data["kv_cache"] = kv_cache
+            
+        return return_data
+        
+class PaliGemmaMultiModalProjector(nn.Module):
+    def __init__(self, config: PaliGemmaConfig):
+        super().__init__()
+        self.linear = nn.Linear(config.vision_config.hidden_size, config.vision_config.projection_dim, bias=True)
+        
+    def forward(self, image_features):
+        hidden_states = self.linear(image_features)
+        return hidden_states
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
@@ -104,7 +178,36 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
         final_embedding = torch.where(pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding)
         
-        pass #continue
+        # creating attention mask
+        
+        dtype, device = inputs_embed.dtype, inputs_embed.device
+        min_dtype = torch.finfo(dtype).min
+        q_len = inputs_embed.shape[1]
+        
+        if kv_cache is None or kv_cache.num_items()==0:
+            casual_mask = torch.full((batch_size, q_len, q_len),
+                                     fill_value=0,
+                                     dtype=dtype,
+                                     device=device)
+        else:
+            assert q_len==1
+            kv_len = kv_cache.num_items()+q_len
+            casual_mask = torch.full((batch_size, q_len, q_len),
+                                     fill_value=0,
+                                     dtype=dtype,
+                                     device=device)
+        
+        # from ([batch_size, q_len, kv_len]) -> ([batch_size, num_heads, q_len, kv_len])
+        casual_mask = casual_mask.unsqueeze(1)
+        
+        if kv_cache is not None and kv_cache.num_items()>0:
+            position_ids = attention_mask.cumsum(-1)[:, -1]
+            if position_ids.dim()==1:
+                position_ids=position_ids.unsqueeze(0)
+        else:
+            position_ids= (attention_mask.cumsum(-1)).masked_fill_((attention_mask==0), 1).to(device)
+        
+        return final_embedding, casual_mask, position_ids
     
     def forward(self,
                 input_ids: torch.LongTensor = None,
