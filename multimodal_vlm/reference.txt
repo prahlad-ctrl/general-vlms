@@ -1,0 +1,2 @@
+PaliGemma model -
+this is from the paper 'PaliGemma: A versatile 3B VLM for transfer' by the Google DeepMind team.
